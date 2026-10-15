@@ -39,8 +39,8 @@ whole surface), with a different cause.
 
 ## Filed as
 
-- React Native: <ISSUE_URL>
-- Fix: <PR_URL> (the `fixed` branch of this repo applies the same change)
+- React Native: [react/react-native#59112](https://github.com/react/react-native/issues/59112)
+- Fix: [react/react-native#59113](https://github.com/react/react-native/pull/59113) (the `fixed` branch of this repo applies the same change)
 
 ## Environment
 
