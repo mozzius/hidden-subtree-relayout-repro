@@ -1,26 +1,45 @@
-# Any commit under a `<Modal>` re-lays out the whole surface (new architecture)
+# Commits under a `display: 'none'` view re-lay out the whole surface (new architecture)
 
-`ModalHostViewComponentDescriptor::adopt()` calls
-`YogaLayoutableShadowNode::setSize()` and `setPositionType()` on every clone of
-the `ModalHostView`. Both mark the Yoga node dirty even when nothing changed.
-A ShadowTree commit clones the path from the changed node up to the root, so
-**any commit that touches anything inside a visible `<Modal>` dirties the
-root**. `RootShadowNode::layoutIfNeeded` then re-runs Yoga layout, including
-`roundLayoutResultsToPixelGrid` over every node in the surface, even if the
-commit only changed a scroll offset or a color.
+Yoga never clears the dirty flags of the descendants of a `display: 'none'`
+node. When it lays out the hidden node's parent, it zeroes out the hidden
+subtree and marks the hidden node itself clean, but leaves everything below it
+as it was. So a view that was created or changed while its ancestor was
+hidden stays dirty until the ancestor is shown again.
 
-The most common way to hit this is scrolling a list inside a Modal (a bottom
-sheet, a picker). Every scroll event commits a `contentOffset` state update,
-and each of those commits re-lays out the entire screen behind the Modal.
+`YogaLayoutableShadowNode::updateYogaChildren` marks a cloned node dirty if
+any of its children is dirty. A ShadowTree commit clones every ancestor of
+the changed node, so **any commit that touches something under the hidden
+node dirties the hidden node, and from there the root**.
+`RootShadowNode::layoutIfNeeded` then re-runs Yoga layout, including
+`roundLayoutResultsToPixelGrid` over every node in the surface. None of that
+work can change anything, because a `display: 'none'` node is zero-sized
+whatever its children are.
 
-The same pattern was found and fixed in react-native-screens
-([software-mansion/react-native-screens#4922](https://github.com/software-mansion/react-native-screens/pull/4922)),
-where pixel-grid rounding was about 90% of the layout time in the Bluesky app.
+In core React Native, the realistic trigger is a JS-driven `Animated` loop
+(`useNativeDriver: false`) on a view inside a `display: 'none'` container,
+e.g. a spinner or a loading shimmer in a collapsed section. On Fabric, JS-driven
+Animated applies each frame with `setNativeProps`, which commits to the
+ShadowTree, so the hidden animation pays for a full layout pass on every
+frame. Animation libraries that commit to the ShadowTree hit the same path. We
+found this in the Bluesky app through a Reanimated `useAnimatedStyle` on a
+hidden pull-to-refresh spinner in a profile header, which re-ran layout on
+every scroll frame.
+
+React's `<Activity mode="hidden">` hides its content the same way, and leaves
+stale-dirty nodes behind whenever it pre-renders or re-renders hidden content.
+In practice, though, we couldn't find a core API that commits into a hidden
+Activity without going through React. See [`<Activity>`](#activity) below.
+
+This is a sibling of the Modal bug in
+[mozzius/modal-relayout-repro](https://github.com/mozzius/modal-relayout-repro)
+([react/react-native#59100](https://github.com/react/react-native/issues/59100)):
+the same symptom (commits that don't go through React re-run layout over the
+whole surface), with a different cause.
 
 ## Filed as
 
-- React Native: [react/react-native#59100](https://github.com/react/react-native/issues/59100)
-- Fix: [react/react-native#59101](https://github.com/react/react-native/pull/59101) (the `fixed` branch of this repo applies the same change)
+- React Native: <ISSUE_URL>
+- Fix: <PR_URL> (the `fixed` branch of this repo applies the same change)
 
 ## Environment
 
@@ -30,8 +49,7 @@ where pixel-grid rounding was about 90% of the layout time in the Bluesky app.
 | react | 19.2.3 |
 | Architecture | New (Fabric), Hermes |
 | Reproduced on | iOS Simulator, iPhone 17, iOS 26.5, Release build (Xcode 27.0) |
-| Also reproduced on | Android emulator, Pixel 9, API 36, Release build (`setNativeProps` trigger only, see below) |
-| Dependencies | None beyond the template. No navigation, no Reanimated, no `react-native-screens` |
+| Dependencies | None beyond the template |
 
 ## Steps to reproduce
 
@@ -42,176 +60,243 @@ yarn install
 yarn ios --mode Release
 ```
 
-The main screen renders 1000 rows (`ROW_COUNT` in `App.tsx`), so a full
-layout pass is expensive enough to measure.
+Tap **Run all**. The app runs every scenario below 3 times, alternating the
+order, and prints the median and p90 time per commit for each run. A full run
+takes about two minutes.
 
-### 1. Scrolling (needs a profiler)
+You can also start it from the command line:
 
-1. Attach Instruments' Time Profiler (or any sampling profiler) to the app.
-2. Scroll the main list a few times.
-3. Tap **Open scroll Modal** and scroll the list inside the Modal the same way.
-4. Compare the time spent under `RootShadowNode::layoutIfNeeded` on the
-   `com.facebook.react.runtime.JavaScript` thread.
-
-### 2. `setNativeProps` (on screen, no profiler)
-
-1. Tap **Run outside Modal** and wait for the result line.
-2. Tap **Run inside Modal** and wait for the result line.
+```bash
+xcrun simctl launch booted org.reactjs.native.example.ReproducerApp -autorun 1
+```
 
 ### Expected
 
-Neither trigger changes anything layout-related, so commits inside the Modal
-should cost the same as commits outside it, and neither should run layout.
+Every scenario only changes a color or an opacity, so no commit should touch
+layout. The scenarios with a hidden view should cost the same as the
+controls.
 
 ### Actual
 
-Commits inside the Modal re-lay out the whole surface. Outside the Modal they
-don't run layout at all.
+Commits under a hidden view whose subtree was created or changed while hidden
+re-lay out the whole surface. Everything else runs no layout at all.
 
-**Scrolling** (iOS)
+Per-commit time in ms, median / p90. Each cell is the median over 9 runs of
+120 commits (3 app launches × 3 rounds, launches alternating between the two
+builds). Both builds are React Native 0.87.1 built from source; the "fixed"
+column adds the patch from the `fixed` branch.
 
-- The run was 8 identical swipes, no momentum: 4 scrolling down, then 4
-  scrolling back up.
-- Sampled with Time Profiler at 1 ms.
-- The window runs from 0.3 s before the first `scrollViewDidScroll` sample to
-  1 s after the last.
-- Each column is the mean of 3 runs, run alternately.
-
-| JS thread | outside Modal | inside Modal | inside Modal, fixed |
-| --- | ---: | ---: | ---: |
-| busy | 32 ms | **176 ms** | 43 ms |
-| in state-update commits (`UIManager::updateState`) | 3 ms | **135 ms** | 13 ms |
-| … in `RootShadowNode::layoutIfNeeded` | 0 ms | **129 ms** | 0 ms |
-| … in `roundLayoutResultsToPixelGrid` | 0 ms | **124 ms** | 0 ms |
-
-Counting with lldb in separate runs, the same swipes produced:
-
-- outside: 188 state updates and 0 layout passes;
-- inside: 160 state updates and 152 layout passes.
-
-That's about 0.85 ms of layout per scroll event, on a simulator running on a
-desktop CPU. lldb slows the app down, so the counts are approximate.
-
-**`setNativeProps`** (iOS): per-commit time measured on screen, 120 commits
-per run. Mean of 3 alternating pairs:
-
-| | outside Modal, median / p90 | inside Modal, median / p90 |
+| Scenario | stock | fixed |
 | --- | ---: | ---: |
-| stock | 0.18 / 0.22 ms | **1.47 / 2.00 ms** |
-| fixed | 0.20 / 0.24 ms | 0.22 / 0.27 ms |
+| `visible` (control) | 0.19 / 0.23 | 0.19 / 0.24 |
+| `opacity0` (control) | 0.17 / 0.23 | 0.17 / 0.22 |
+| **`hidden`** | **1.06 / 2.02** | 0.15 / 0.21 |
+| `hiddenAfterLayout` | 0.15 / 0.23 | 0.16 / 0.20 |
+| **`hiddenThenChanged`** | **1.01 / 2.06** | 0.16 / 0.20 |
+| `hiddenSibling` (control) | 0.18 / 0.23 | 0.18 / 0.22 |
+| `activityAfterLayout` | 0.15 / 0.22 | 0.16 / 0.23 |
+| **`activityThenChanged`** | **1.18 / 2.03** | 0.16 / 0.21 |
+| `activitySibling` (control) | 0.11 / 0.24 | 0.13 / 0.23 |
+| `animatedJsVisible` (control) | 0.14 / 0.18 | 0.15 / 0.18 |
+| **`animatedJsHidden`** | **1.09 / 1.95** | 0.13 / 0.17 |
 
-**Android emulator**
+The prebuilt React Native core (`bundle exec pod install` without
+`RCT_USE_PREBUILT_RNCORE=0`) measured the same as stock from source: 1.12 /
+2.01 ms for `hidden` and 1.09 / 1.98 ms for `animatedJsHidden`, with the
+controls at 0.15–0.19 ms (6 runs).
 
-- 5 pairs, measured on an earlier revision of this app that still used
-  `react-native-safe-area-context`.
-- The medians were 0.77 ms outside and **19.9 ms** inside.
-- Perfetto puts the inside time on the JS thread in
-  `fmod <- [unsymbolised Yoga rounding frames] <- YogaLayoutableShadowNode::layoutTree <- ShadowTree::tryCommit <- UIManager::setNativeProps_DEPRECATED`.
+Counting with lldb (a breakpoint on
+`YogaLayoutableShadowNode::layoutTree`) gives the same split. On stock, each
+of the 120 commits in `hidden`, `hiddenThenChanged` and `activityThenChanged`
+ran a layout pass, and so did every frame of `animatedJsHidden`. None of the
+`setNativeProps` commits in the other scenarios ran one. With the fix, none of
+the `setNativeProps` commits in any scenario ran a layout pass.
 
-## Controls
+## Scenarios
 
-- **Run outside Modal** / **Run inside Modal** mount a small view, either in
-  the main screen or inside a transparent `<Modal>`. The view then changes its
-  own background color once per frame, 120 times, with `setNativeProps`.
-  - Each sample times one `setNativeProps` call. That call is one synchronous
-    ShadowTree commit on the JS thread: `ShadowNode::cloneTree`, layout and
-    mount.
-  - The result line shows the median and p90.
-- **Open scroll Modal** opens a transparent `<Modal>` with a 60-row
-  `ScrollView` over the main list. **Close scroll Modal** closes it.
-- `ROW_COUNT` sets how many rows the main screen renders, and so how expensive
-  a full layout pass is.
+Each scenario mounts a fresh stage above the 1000-row list (`ROW_COUNT` in
+`App.tsx`), then changes a 80×40 target view once per frame, 120 times. The
+`color` scenarios set its background color with `setNativeProps`, and time
+each call. That call is one synchronous ShadowTree commit on the JS thread:
+`ShadowNode::cloneTree`, layout and commit hooks. The `animated` scenarios run
+an `Animated.loop` with `useNativeDriver: false` on the target's opacity. They
+time the `setNativeProps` calls Animated makes, by wrapping the instance's
+`setNativeProps`.
+
+- **`visible`**: the target in a visible container.
+- **`opacity0`**: the container has `opacity: 0`, so it's invisible but still
+  laid out by Yoga.
+- **`hidden`**: the container has `display: 'none'`, and the target was
+  mounted with it, so it was created while hidden.
+- **`hiddenAfterLayout`**: the target is laid out while visible, then the
+  container is hidden with a React state change. Nothing under it changes
+  while hidden, so its children are clean.
+- **`hiddenThenChanged`**: as `hiddenAfterLayout`, then React re-renders a
+  `<Text>` sibling of the target while the container is hidden.
+- **`hiddenSibling`**: the target is a visible sibling of a hidden container
+  whose children were created while hidden. The hidden node isn't an ancestor
+  of the target, so the commit doesn't clone it.
+- **`activityAfterLayout`**, **`activityThenChanged`**: like the
+  `hiddenAfterLayout` scenarios, but hidden with
+  `<Activity mode="hidden">`. Activity detaches refs when it hides, so the
+  target instance is captured before hiding.
+- **`activitySibling`**: a visible target next to an Activity that was
+  pre-rendered hidden.
+- **`animatedJsVisible`**, **`animatedJsHidden`**: a JS-driven Animated loop
+  on a target in a visible container, or one created inside a
+  `display: 'none'` container.
+
+## `<Activity>`
+
+`<Activity mode="hidden">` hides its content with exactly this pattern. The
+Fabric renderer's `cloneHiddenInstance` (`ReactFabric-prod.js`) clones each
+top-level host node of the hidden content with new props and keeps its
+children:
+
+```js
+function cloneHiddenInstance(instance) {
+  var node = instance.node,
+    updatePayload = ReactNativePrivateInterface.createAttributePayload(
+      { style: { display: "none" } },
+      instance.canonical.viewConfig.validAttributes
+    );
+  return {
+    node: cloneNodeWithNewProps(node, updatePayload),
+    canonical: instance.canonical
+  };
+}
+```
+
+Suspense hides already-shown content behind a fallback through the same
+function. We didn't test Suspense separately.
+
+**Activity creates stale-dirty nodes routinely.** Pre-rendering
+(`mode="hidden"` from the start) creates the whole subtree while hidden.
+Updates to hidden content still render, at offscreen priority, and commit
+under the hidden node. `activityThenChanged` shows the result: a commit
+under the hidden content re-runs layout from the root on every commit.
+
+**But commits that don't go through React rarely reach it.** When an
+Activity hides, React detaches every ref in it, unmounts its layout effects
+and calls `componentWillUnmount` on its class components
+(`recursivelyTraverseDisappearLayoutEffects`). We probed what still commits
+into a hidden Activity, counting commits with lldb (stock and fixed
+behaved the same):
+
+| What | Commits while hidden |
+| --- | --- |
+| `setNativeProps` on an instance captured before hiding | Yes, 1 per call. Each one re-runs layout on stock if anything under the Activity changed while hidden (`activityThenChanged`), none with the fix. |
+| JS-driven `Animated.loop`, started while visible | No. 61 `setNativeProps` calls in 1 s while visible, 0 in 2 s once hidden: the ref cleanup in `useAnimatedProps` drops the update callback. |
+| Native-driven `Animated.loop`, started while visible | No. It doesn't commit to the ShadowTree while visible either (`cxxNativeAnimatedEnabled` is off by default in OSS). |
+| `ScrollView.scrollTo()` on an instance captured before hiding | No. 60 `contentOffset` state updates while visible, 0 while hidden. |
+| A `ScrollView`, a remote `Image`, a `TextInput` and an `ActivityIndicator`, idle | No commits while pre-rendered hidden or hidden after being shown. One state update while visible. |
+
+So in core React Native, Activity only triggers this bug through a stale
+instance captured before hiding, which is contrived. Third-party libraries
+that commit to the ShadowTree without going through refs could still reach
+hidden content. We didn't test any.
+
+A plain `display: 'none'` view is different: refs stay attached and effects
+keep running, so a JS-driven animation keeps committing
+(`animatedJsHidden`).
 
 ## Root cause
 
-Every clone of a `ModalHostView` runs its descriptor's `adopt()`
-(`ReactCommon/react/renderer/components/modal/ModalHostViewComponentDescriptor.h`):
+Yoga lays out a `display: 'none'` child like this
+(`ReactCommon/yoga/yoga/algorithm/CalculateLayout.cpp`):
 
 ```cpp
-void adopt(ShadowNode &shadowNode) const override
-{
-  auto &layoutableShadowNode = static_cast<YogaLayoutableShadowNode &>(shadowNode);
-  auto &stateData = static_cast<const ModalHostViewShadowNode::ConcreteState &>(*shadowNode.getState()).getData();
-
-  layoutableShadowNode.setSize(Size{.width = stateData.screenSize.width, .height = stateData.screenSize.height});
-  layoutableShadowNode.setPositionType(YGPositionTypeAbsolute);
-
-  ConcreteComponentDescriptor::adopt(shadowNode);
+if (child->style().display() == Display::None) {
+  if (performLayout) {
+    zeroOutLayoutRecursively(child);
+    child->setHasNewLayout(true);
+    child->setDirty(false);
+  }
+  continue;
 }
 ```
 
-`setSize` and `setPositionType` dirty the node unconditionally
-(`ReactCommon/react/renderer/components/view/YogaLayoutableShadowNode.cpp:587`
-and `:624`). `setPadding`, in between them at `:599`, compares the new value
-first:
+`zeroOutLayoutRecursively` resets the layout of every descendant but never
+touches their dirty flags. Fabric's `YogaLayoutableShadowNode::layout` doesn't
+recurse into `display: none` children either. New Yoga nodes start dirty, and
+a React commit dirties every node it clones with new children
+(`appendChild`), so anything created or changed under a hidden node stays
+dirty while it's hidden.
+
+`YogaLayoutableShadowNode::updateYogaChildren`
+(`ReactCommon/react/renderer/components/view/YogaLayoutableShadowNode.cpp`)
+runs on every clone that gets a new child list, which is every ancestor in
+`ShadowNode::cloneTree`:
 
 ```cpp
-void YogaLayoutableShadowNode::setSize(Size size) const {
-  ensureUnsealed();
-
-  auto style = yogaNode_.style();
-  style.setDimension(
-      yoga::Dimension::Width, yoga::StyleSizeLength::points(size.width));
-  style.setDimension(
-      yoga::Dimension::Height, yoga::StyleSizeLength::points(size.height));
-  yogaNode_.setStyle(style);
-  yogaNode_.setDirty(true);
-}
+bool isClean = !YGNodeIsDirty(&yogaNode_) &&
+    getChildren().size() == YGNodeGetChildCount(&yogaNode_);
+...
+      if (isClean) {
+        ...
+        isClean = isClean && !newYogaChildNode.isDirty() &&
+            (newYogaChildNode.style() == oldYogaChildNode.style());
+      }
+...
+yogaNode_.setDirty(!isClean);
 ```
 
-The path from a scroll event to the full layout pass:
+The hidden node sees its stale-dirty child, marks itself dirty, and each
+ancestor above it does the same.
 
-1. `UIManager::updateState` (or `setNativeProps_DEPRECATED`) calls
-   `ShadowTree::commit`.
-2. `ShadowNode::cloneTree` clones every ancestor of the changed node, including
-   the `ModalHostView`.
-3. `ModalHostViewComponentDescriptor::adopt` runs on that clone and calls
-   `setSize`, which calls `yoga::Node::setDirty(true)`.
-4. `updateYogaChildren` on each ancestor sees a dirty child and dirties itself,
-   all the way up to the `RootView`.
-5. `RootShadowNode::layoutIfNeeded` calls `YogaLayoutableShadowNode::layoutTree`,
-   which calls `roundLayoutResultsToPixelGrid`.
+A breakpoint on `yoga::Node::setDirty` (stopping only on `setDirty(true)`)
+in the `hidden` scenario shows the first node to turn dirty in each
+`setNativeProps` commit. The first line reads the node's state with
+`YGNodeIsDirty`, `YGNodeStyleGetDisplay` and `YGNodeGetChildCount` before the
+call:
 
-A breakpoint on `yoga::Node::setDirty` confirms this:
+```
+node: wasDirty=0 display=none children=2
+yoga::Node::setDirty
+YogaLayoutableShadowNode::updateYogaChildren
+YogaLayoutableShadowNode::YogaLayoutableShadowNode
+ViewShadowNode::ViewShadowNode
+...
+ConcreteComponentDescriptor<ViewShadowNode>::cloneShadowNode
+ShadowNode::clone
+ShadowNode::cloneTree
+UIManager::setNativeProps_DEPRECATED::$_0::operator()::'lambda'
+ShadowTree::tryCommit
+ShadowTree::commit
+UIManager::setNativeProps_DEPRECATED
+NativeDOM::setNativeProps
+```
 
-- **Inside the Modal**, every scroll commit starts with exactly this chain:
-  `setSize <- ModalHostViewComponentDescriptor::adopt <- ConcreteComponentDescriptor<ModalHostViewShadowNode>::cloneShadowNode <- ShadowNode::clone <- ShadowNode::cloneTree <- UIManager::updateState <- ShadowTree::tryCommit`.
-  It then propagates to the root.
-- **Outside the Modal**, the same scroll commits turn no Yoga node from clean
-  to dirty.
+`hiddenThenChanged`, `activityThenChanged` and `animatedJsHidden` show the
+same stack. In the controls, no node turns dirty during the clone. After
+each layout pass, Yoga's `display: none` branch marks the hidden node clean
+again, and the next commit dirties it again.
 
-Yoga's measurement cache keeps `calculateLayoutImpl` cheap for the clean
-siblings. But `roundLayoutResultsToPixelGrid` (`yoga/algorithm/PixelGrid.cpp`)
-recurses into every node of the tree whenever the root is laid out. That's
-where the time goes.
+## Why the repro doesn't time React commits
 
-## Why the repro doesn't time React state updates
-
-A React commit can't show this bug, because every React commit already
-dirties every ancestor up to the root, Modal or not:
+A React commit lays out from the root whether or not anything is hidden:
 
 - The Fabric renderer clones each ancestor with
   `cloneNodeWithNewChildren(node)` and an empty child list, then calls
-  `appendChild` for each child (`ReactFabric-prod.js`, `completeWork`).
-- `YogaLayoutableShadowNode::appendChild` always dirties the node: "we don't
-  have anything to compare the Yoga node with … Therefore we must dirty the
-  node" (`YogaLayoutableShadowNode.cpp:241`).
-- `UIManagerBinding.cpp` already accepts a child list. Lines 330, 383, 423 and
-  440 carry TODOs that reference `passChildrenWhenCloningPersistedNodes`, but
-  the renderer shipped in react-native doesn't pass one.
+  `appendChild` for each child.
+- `YogaLayoutableShadowNode::appendChild` always dirties the node, because
+  it has nothing to compare the Yoga node with.
 
-An earlier version of this repro timed a React state change from render to
-`useLayoutEffect`. It measured the same about 1 ms of full layout per commit
-inside and outside the Modal. The commits that pay for the Modal bug are the
-ones that don't go through React: state updates such as scrolling,
-`setNativeProps`, and animation libraries that commit to the ShadowTree.
+The commits that pay for this bug are the ones that don't go through React:
+`setNativeProps`, JS-driven Animated, native state updates such as a
+ScrollView's `contentOffset`, and animation libraries that commit to the
+ShadowTree.
 
 ## The `fixed` branch
 
 The `fixed` branch adds the fix as a `patch-package` patch
-(`ReproducerApp/patches/react-native+0.87.1.patch`). With it, `setSize` and
-`setPositionType` return early when the value is unchanged. The core has to be
-built from source for the patch to take effect:
+(`ReproducerApp/patches/react-native+0.87.1.patch`). With it,
+`updateYogaChildren` doesn't compare the children of a `display: none` node,
+because they can't change its layout. It still checks the node's own dirty
+flag and child count. Showing the node again changes its style, which
+dirties it in `updateYogaProps`.
+
+The core has to be built from source for the patch to take effect:
 
 ```bash
 git checkout fixed
@@ -221,41 +306,51 @@ yarn install    # postinstall applies the patch
 yarn ios --mode Release
 ```
 
-The "fixed" columns above come from this branch. On an earlier revision, a
-stock from-source build measured the same as the prebuilt one
-(`setNativeProps`: 0.13 ms outside, 1.02 ms inside), so the build mode isn't
-what makes the difference.
+To check that showing a view again still lays it out, launch with
+`-scenario unhide`:
+
+```bash
+xcrun simctl launch booted org.reactjs.native.example.ReproducerApp -scenario unhide
+```
+
+It hides three containers, re-renders a label inside each while hidden,
+changes each target's color 30 times with `setNativeProps`, then shows them
+again: one with `setNativeProps({style: {display: 'flex'}})`, one with a
+React state change and one by switching an Activity back to visible. Every
+row lays out the same as the never-hidden reference row on both builds. The
+Activity row keeps its initial color on both builds: React commits its own
+nodes when it shows an Activity, which drops `setNativeProps` changes made
+while it was hidden.
 
 ## What is and is not needed
 
 **Required:**
 
-- A visible `<Modal>` with the changed node inside it.
-- A commit that doesn't go through React, such as a ScrollView `contentOffset`
-  state update or `setNativeProps`.
+- A `display: 'none'` view whose subtree was created or changed while it was
+  hidden. A subtree laid out before hiding and left alone stays clean
+  (`hiddenAfterLayout`, `activityAfterLayout`).
+- A commit that doesn't go through React and changes something under the
+  hidden view. Commits elsewhere in the tree don't clone the hidden view, so
+  they don't see its dirty children (`hiddenSibling`, `activitySibling`).
 - Enough nodes in the rest of the surface for a full pass to cost something.
-  On an earlier revision the gap was already visible with 250 rows: 0.29 vs
-  0.67 ms per `setNativeProps` commit.
 
 **Not required:**
 
-- `react-native-safe-area-context`. Earlier revisions used it, and removing it
-  didn't change the result (0.19 vs 1.10 ms before, 0.18 vs 1.47 ms after).
+- Any third-party library. JS-driven `Animated` is enough.
 - Navigation, Reanimated or `react-native-screens`.
 - A physical device.
 
 **Not tested:**
 
-- A non-transparent Modal.
-- Modal animation types other than `none`.
+- Android. The code involved is shared C++, so we expect the same result.
+- Suspense fallbacks, which hide content through the same path as Activity.
 
 ## Measurement notes
 
 - Simulator timings depend on whether the JS thread lands on a performance or
-  an efficiency core. Absolute sub-millisecond numbers moved between sessions:
-  inside-Modal `setNativeProps` medians ranged from 0.46 to 1.57 ms.
-- Inside vs outside was consistently about 6–8× for `setNativeProps`. For
-  scrolling, the inside Modal runs layout on nearly every commit, and the
-  outside runs none.
-- The Android numbers come from the emulator. Treat them as a second data point
-  rather than device performance.
+  an efficiency core. On stock, the median of a single run of an affected
+  scenario ranged from 0.41 to 1.38 ms, and its p90 from 1.77 to 2.25 ms.
+- Every other run, on every build, had a median between 0.06 and 0.23 ms and
+  a p90 under 0.3 ms.
+- lldb slows the app down, so we only used it to count commits and layout
+  passes, never for timings.

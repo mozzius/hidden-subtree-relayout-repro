@@ -758,7 +758,11 @@ function App() {
 
 /**
  * Checks that showing a view again after it was hidden still lays out its
- * children correctly. Every row should look like the first one.
+ * children correctly. Every row should have the same layout as the first one.
+ *
+ * The Activity row's box ends up in its initial color with or without the
+ * fix: when an Activity is shown again, React commits the nodes it rendered,
+ * so `setNativeProps` changes made while it was hidden are dropped.
  */
 function UnhideCheck() {
   const [label, setLabel] = useState('initial');
@@ -810,7 +814,9 @@ function UnhideCheck() {
   return (
     <View style={styles.container}>
       <View style={styles.controls}>
-        <Text>Un-hide check: {status}. All rows should match.</Text>
+        <Text>
+          Un-hide check: {status}. Every row should have the same layout.
+        </Text>
         <Text>Reference (never hidden)</Text>
         <View style={styles.box}>
           <View ref={referenceTarget} style={styles.target} />
@@ -826,7 +832,7 @@ function UnhideCheck() {
           <View ref={reactTarget} style={styles.target} />
           <Text>{label}</Text>
         </View>
-        <Text>Activity, shown with React</Text>
+        <Text>Activity, shown with React (keeps its initial color)</Text>
         <Activity mode={activityHidden ? 'hidden' : 'visible'}>
           <View style={styles.box}>
             <View ref={keep(activityTarget)} style={styles.target} />
