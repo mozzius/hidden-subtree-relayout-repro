@@ -115,7 +115,7 @@ the `setNativeProps` commits in any scenario ran a layout pass.
 ## Scenarios
 
 Each scenario mounts a fresh stage above the 1000-row list (`ROW_COUNT` in
-`App.tsx`), then changes a 80×40 target view once per frame, 120 times. The
+`App.tsx`), then changes an 80×40 target view once per frame, 120 times. The
 `color` scenarios set its background color with `setNativeProps`, and time
 each call. That call is one synchronous ShadowTree commit on the JS thread:
 `ShadowNode::cloneTree`, layout and commit hooks. The `animated` scenarios run
