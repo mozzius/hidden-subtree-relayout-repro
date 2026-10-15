@@ -27,8 +27,9 @@ every scroll frame.
 
 React's `<Activity mode="hidden">` hides its content the same way, and leaves
 stale-dirty nodes behind whenever it pre-renders or re-renders hidden content.
-In practice, though, we couldn't find a core API that commits into a hidden
-Activity without going through React. See [`<Activity>`](#activity) below.
+In practice, though, the only way we found for core APIs to commit into a
+hidden Activity outside React was `setNativeProps` on an instance captured
+before hiding. See [`<Activity>`](#activity) below.
 
 This is a sibling of the Modal bug in
 [mozzius/modal-relayout-repro](https://github.com/mozzius/modal-relayout-repro)
